@@ -30,8 +30,8 @@ MODEL_REPO, TOK_REPO = "NeoQuasar/Kronos-mini", "NeoQuasar/Kronos-Tokenizer-2k"
 import subprocess, sys, zipfile
 from pathlib import Path
 
-subprocess.run([sys.executable, "-m", "pip", "install", "-q",
-                "huggingface_hub", "PyTorchModelHubMixin", "pandas", "pyarrow"], check=True)
+subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U",
+                "huggingface_hub", "pandas", "pyarrow"], check=True)
 try:
     from google.colab import drive  # type: ignore
     drive.mount("/content/drive")   # one consent click; session is already logged in
