@@ -20,11 +20,12 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 HERE = Path(__file__).parent
-ROOT = HERE.parents[2]
-sys.path.insert(0, str(ROOT / "rl-strategy-optimizer" / "src" / "rl_brain_v2"))
+ROOT = HERE.parents[2] if len(HERE.parents) > 2 else None
+if ROOT is not None:
+    sys.path.insert(0, str(ROOT / "rl-strategy-optimizer" / "src" / "rl_brain_v2"))
 import tape_feel as TF  # noqa: E402
 
-TAPE = ROOT / "agent_work" / "kimi" / "tmp" / "xauusd_m1_vps_20220901_20261022.csv"
+TAPE = ROOT / "agent_work" / "kimi" / "tmp" / "xauusd_m1_vps_20220901_20261022.csv" if ROOT is not None else None
 MANIFEST = HERE / "sample_manifest_20261022.csv"
 SHOW, WARM, AHEAD = 72, 160, 26
 BG, FG, GRID = "#121418", "#c8d0dc", "#2a2e36"
