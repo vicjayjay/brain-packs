@@ -15,7 +15,8 @@ PRE-COMMITTED choices (edit AFTER seeing results = p-hacking; changes need a new
   OPT          AdamW lr 3e-4 wd 1e-4, cosine to 0, 1-epoch linear warmup, 20 epochs,
                batch 512, bf16 autocast.
   EMBED        backbone only (512-d, projection head discarded), bf16 autocast;
-               batch auto-sizes to GPU memory (does not change the trained model).
+               default batch 512, <=4 workers, prefetch 2 to bound HOST RAM;
+               optional batch override with CUDA-OOM halving (model unchanged).
 
 One runtime owns pretraining. Any number of runtimes can then embed disjoint,
 interleaved shards of the SAME frozen encoder. Deterministic 50k-row parts and
@@ -43,6 +44,9 @@ BATCH = 512
 LR = 3e-4
 WD = 1e-4
 TAU = 0.2
+EMB_BATCH = 512
+EMB_WORKERS = 4
+EMB_PREFETCH = 2
 EMB_PART_ROWS = 50_000
 
 
@@ -69,18 +73,18 @@ def _worker_count() -> int:
     return max(2, min(32, os.cpu_count() or 2))
 
 
-def _loader_kwargs(workers: int) -> dict:
+def _loader_kwargs(workers: int, prefetch: int = 4) -> dict:
     kw = dict(num_workers=workers, pin_memory=True,
               persistent_workers=workers > 0)
     if workers > 0:
-        kw["prefetch_factor"] = 4
+        kw["prefetch_factor"] = prefetch
     return kw
 
 
-def _auto_embed_batch() -> int:
-    import torch
-    gib = torch.cuda.get_device_properties(0).total_memory / 2**30
-    return max(1024, min(8192, int(gib * 128 // 256 * 256)))
+def _embed_resource_plan(workers: int | None, batch_size: int) -> tuple[int, int, int]:
+    batch = batch_size or EMB_BATCH
+    nworkers = min(EMB_WORKERS, _worker_count()) if workers is None else workers
+    return batch, nworkers, EMB_PREFETCH
 
 
 def merge_embedding_manifests(out: Path, nshards: int) -> dict:
@@ -315,10 +319,9 @@ def embed(idx, out: Path, shard: int = 0, nshards: int = 1,
         xs = torch.stack([b[1] for b in batch])
         return es, xs
 
-    workers = _worker_count() if workers is None else workers
-    batch_size = batch_size or _auto_embed_batch()
+    batch_size, workers, prefetch = _embed_resource_plan(workers, batch_size)
     print(f"embed shard {shard}/{nshards}: {len(idx):,} rows, batch {batch_size}, "
-          f"workers {workers}, prefetch 4, bf16", flush=True)
+          f"workers {workers}, prefetch {prefetch}, bf16", flush=True)
     man_f = out / f"emb_panels_manifest_s{shard}.json"
     man = json.loads(man_f.read_text()) if man_f.exists() else {
         "job": "panel_embed_job4", "shard": shard, "nshards": nshards,
@@ -348,7 +351,7 @@ def embed(idx, out: Path, shard: int = 0, nshards: int = 1,
             try:
                 dl = DataLoader(_IdxDS(part_idx, train=False), batch_size=batch_size,
                                 shuffle=False, collate_fn=collate,
-                                **_loader_kwargs(workers))
+                                **_loader_kwargs(workers, prefetch))
                 with torch.inference_mode():
                     for es, xs in dl:
                         xs = xs.to(dev, non_blocking=True)
@@ -397,9 +400,9 @@ def main():
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--nshards", type=int, default=1)
     ap.add_argument("--workers", type=int, default=-1,
-                    help="data-loader workers; -1 auto-uses available vCPUs (cap 32)")
+                    help="data-loader workers; pretrain auto uses vCPUs, embed caps at 4")
     ap.add_argument("--embed-batch", type=int, default=0,
-                    help="inference batch; 0 auto-sizes from GPU memory with OOM fallback")
+                    help="inference batch; 0 uses host-RAM-safe 512 with CUDA-OOM fallback")
     ap.add_argument("--allow-partial", action="store_true",
                     help="embed before the farm is complete (NOT judged-safe)")
     a = ap.parse_args()
