@@ -51,6 +51,19 @@ CARD_PROMPT = (
     "Be concrete and terse; estimate ATR from the H1 pane's recent candle sizes.")
 
 
+def _candle_bodies(ax, x, o, c, col, width):
+    """One PolyCollection instead of one Rectangle per bar (~200x fewer artists,
+    pixel-identical Agg output: same verts, zorder=1 under the wicks like bar())."""
+    from matplotlib.collections import PolyCollection
+    lo = np.minimum(o, c)
+    hgt = np.maximum(np.abs(c - o), 1e-6)
+    hw = width / 2
+    verts = [[(xi - hw, b), (xi + hw, b), (xi + hw, b + h), (xi - hw, b + h)]
+             for xi, b, h in zip(x, lo, hgt)]
+    ax.add_collection(PolyCollection(verts, facecolors=list(col),
+                                     edgecolors="none", zorder=1))
+
+
 def price_strip(ax, h, title):
     p = panes(h)
     n = len(h)
@@ -59,7 +72,7 @@ def price_strip(ax, h, title):
     o, hi, lo, c = (h[k].to_numpy()[s] for k in ("open", "high", "low", "close"))
     col = np.where(c >= o, "#26b496", "#f05652")
     ax.vlines(x, lo, hi, color=col, lw=1)
-    ax.bar(x, np.maximum(np.abs(c - o), 1e-6), bottom=np.minimum(o, c), width=0.7, color=col)
+    _candle_bodies(ax, x, o, c, col, 0.7)
     ax.plot(x, p["bb_up"].to_numpy()[s], color="#8fa3c0", lw=0.9)
     ax.plot(x, p["bb_dn"].to_numpy()[s], color="#8fa3c0", lw=0.9)
     ax.plot(x, p["kc_up"].to_numpy()[s], color="#c08fbf", lw=0.9, ls="--")

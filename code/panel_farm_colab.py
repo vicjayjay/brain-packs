@@ -46,6 +46,28 @@ def _init_frames(tape_pq: str):
     _SEARCH = {tf: f.index.to_numpy() for tf, f in _FRAMES.items()}
 
 
+_FIG = None
+
+
+def _worker_fig():
+    """One figure per worker process, reused across renders (figure+axes
+    construction was ~0.4s/panel). Callers must clear() every axis first;
+    sharex links survive clear()."""
+    global _FIG
+    if _FIG is None:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from render_jay_template_20261022 import BG
+        fig = plt.figure(figsize=(9, 12), dpi=80, facecolor=BG)
+        gs = fig.add_gridspec(7, 1, height_ratios=[4, 4, 4, 4, 1, 1, 1],
+                              hspace=0.08)
+        axes = [fig.add_subplot(gs[i]) for i in range(4)]
+        axes += [fig.add_subplot(gs[j], sharex=axes[0]) for j in (4, 5, 6)]
+        _FIG = (fig, axes)
+    return _FIG
+
+
 def _render_one(e: int) -> tuple:
     from panel_situation_card import price_strip, SHOW
     from render_jay_template_20261022 import panes, BG, FG, GRID, bars_hist
@@ -56,26 +78,23 @@ def _render_one(e: int) -> tuple:
         if j < NEED:
             return e, "skip"
         idx[tf] = _FRAMES[tf].iloc[j - NEED:j]
-    fig = plt.figure(figsize=(9, 12), dpi=80, facecolor=BG)
-    gs = fig.add_gridspec(7, 1, height_ratios=[4, 4, 4, 4, 1, 1, 1], hspace=0.08)
-    axes = []
+    fig, axes = _worker_fig()
+    for a in axes:
+        a.clear()
     for i, tf in enumerate(("D1", "H4", "H1", "M15")):
-        ax = fig.add_subplot(gs[i])
-        price_strip(ax, idx[tf], f"XAUUSD {tf}")
-        axes.append(ax)
+        price_strip(axes[i], idx[tf], f"XAUUSD {tf}")
     p1 = panes(idx["H1"])
     n = len(idx["H1"])
     s = slice(n - SHOW, n)
     x = np.arange(SHOW)
     for j, k in enumerate(("obv", "ao", "ac"), start=4):
-        a = fig.add_subplot(gs[j], sharex=axes[0])
+        a = axes[j]
         v = p1[k].to_numpy()[s]
         if k == "obv":
             a.plot(x, v, color="#e0b85a", lw=1.0)
         else:
             bars_hist(a, x, v)
         a.set_yticks([])
-        axes.append(a)
     for a in axes:
         a.set_facecolor(BG)
         a.grid(color=GRID, lw=0.5)
@@ -86,7 +105,6 @@ def _render_one(e: int) -> tuple:
     out.mkdir(parents=True, exist_ok=True)
     fig.savefig(out / f"{int(e)}.jpg", facecolor=BG, bbox_inches="tight",
                 pil_kwargs={"quality": 75})
-    plt.close(fig)
     return e, "ok"
 
 

@@ -54,7 +54,17 @@ def panes(h):
 def bars_hist(ax, x, v):
     v = np.asarray(v, float)
     rising = np.r_[True, v[1:] >= v[:-1]]
-    ax.bar(x, v, width=0.8, color=np.where(rising, "#26b496", "#f05652"))
+    # PolyCollection instead of per-bar Rectangles (pixel-identical, much faster);
+    # bar() datalim = [x0-0.4, xN+0.4] x [min(0,vmin), max(0,vmax)] — replicated below
+    from matplotlib.collections import PolyCollection
+    lo, hi = np.minimum(0, v), np.maximum(0, v)
+    verts = [[(xi - 0.4, b), (xi + 0.4, b), (xi + 0.4, t), (xi - 0.4, t)]
+             for xi, b, t in zip(x, lo, hi)]
+    ax.add_collection(PolyCollection(
+        verts, facecolors=list(np.where(rising, "#26b496", "#f05652")),
+        edgecolors="none", zorder=1))
+    ax.update_datalim([(x[0] - 0.4, lo.min()), (x[-1] + 0.4, hi.max())])
+    ax.autoscale_view()
     ax.axhline(0, color=GRID, lw=0.8)
 
 
