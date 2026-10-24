@@ -54,8 +54,22 @@ def extract_panels(drive_panels: Path) -> list[tuple[int, Path]]:
     n_done = int(marker.read_text()) if marker.exists() else 0
     for z in zips[n_done:]:
         print(f"extract {z.name}...", flush=True)
-        with zipfile.ZipFile(z) as zf:
-            zf.extractall(PANELS_LOCAL)
+        for attempt in range(3):
+            try:
+                with zipfile.ZipFile(z) as zf:
+                    zf.extractall(PANELS_LOCAL)
+                break
+            except OSError as ex:
+                # Drive FUSE drops mid-read ("Transport endpoint is not
+                # connected") when the mount blips; wait + retry, and if it
+                # keeps failing tell the operator to re-run the mount cell
+                if attempt == 2:
+                    raise SystemExit(
+                        f"Drive read failed on {z.name} ({ex}). "
+                        "Re-run the mount cell above, then this cell — "
+                        "extraction resumes at the failed zip.")
+                print(f"  drive hiccup ({ex}), retry in 15s...", flush=True)
+                time.sleep(15)
         n_done += 1
         marker.write_text(str(n_done))
     idx = []
@@ -270,10 +284,22 @@ def main():
     ap.add_argument("cmd", choices=["pretrain", "embed", "all"])
     ap.add_argument("--drive-panels", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--allow-partial", action="store_true",
+                    help="embed before the farm is complete (NOT judged-safe)")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    idx = extract_panels(Path(a.drive_panels))
+    drive_panels = Path(a.drive_panels)
+    if a.cmd in ("embed", "all") and not a.allow_partial:
+        # embedding parts are positional over the sorted index: running embed
+        # before the farm is complete would freeze wrong part boundaries
+        if not (drive_panels / "FARM_COMPLETE.txt").exists():
+            raise SystemExit(
+                "refusing to embed: FARM_COMPLETE.txt not in the panels folder. "
+                "Wait until every farm tab prints ALL DONE (the marker file is "
+                "created then), or pass --allow-partial for a dry run that will "
+                "NOT be used for the judge.")
+    idx = extract_panels(drive_panels)
     if a.cmd in ("pretrain", "all"):
         pretrain(idx, out)
     if a.cmd in ("embed", "all"):

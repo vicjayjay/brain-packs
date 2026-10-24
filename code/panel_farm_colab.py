@@ -177,6 +177,14 @@ def main():
            "parts": part, "shard": a.shard, "nshards": a.nshards}
     mname = f"farm_manifest_s{a.shard}.json" if sharded else "farm_manifest.json"
     (drive / mname).write_text(json.dumps(man, indent=2))
+    if sharded:
+        have = [drive / f"farm_manifest_s{k}.json" for k in range(a.nshards)]
+        if all(p.exists() for p in have):
+            (drive / "FARM_COMPLETE.txt").write_text(
+                "all %d shards done %s" % (a.nshards,
+                    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
+            print("FARM_COMPLETE.txt written — job4 embed is now unblocked",
+                  flush=True)
     print(f"ALL DONE — {n_ok} panels this session, {part} part zips", flush=True)
 
 
