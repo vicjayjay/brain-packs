@@ -98,6 +98,9 @@ def main():
     a = ap.parse_args()
     drive = Path(a.drive_dir)
     drive.mkdir(parents=True, exist_ok=True)
+    if PANELS.exists():
+        # leftovers from a crashed run: state file is the only truth, wipe
+        shutil.rmtree(PANELS, ignore_errors=True)
     PANELS.mkdir(exist_ok=True)
 
     _init_frames(str(Path(a.pack_dir) / "tape_xau_m1.parquet"))
@@ -113,32 +116,34 @@ def main():
 
     t0 = time.time()
     n_ok = 0
-    pending: list[int] = []
     part = len(list(drive.glob("panels_part_*.zip")))
     with state_f.open("a") as sf, Pool(a.procs) as pool:
-        for i, (e, r) in enumerate(pool.imap_unordered(_render_one, todo, chunksize=8), 1):
-            pending.append(e)
-            n_ok += (r == "ok")
-            if i % 250 == 0:
-                dt = time.time() - t0
-                eta = dt / i * (len(todo) - i) / 3600
-                print(f"{i}/{len(todo)} ok={n_ok} {dt/i:.2f}s/panel ETA {eta:.1f}h",
-                      flush=True)
-            if len(pending) >= CHUNK:
-                part += 1
-                arc = shutil.make_archive(str(drive / f"panels_part_{part:03d}"),
-                                          "zip", PANELS)
-                sf.write("\n".join(str(x) for x in pending) + "\n")
-                sf.flush()
-                pending = []
-                shutil.rmtree(PANELS)
-                PANELS.mkdir()
-                print(f"checkpoint zip -> {arc} (state flushed)", flush=True)
-        if pending or any(PANELS.iterdir()):
+        # batch-wise: the pool is fully drained BEFORE zip+rmtree, so no worker
+        # can write into PANELS while it is archived/deleted (OSError 39 race,
+        # and worse: files rendered during a zip used to land in the previous
+        # chunk's archive, get deleted, then be marked done in state = lost)
+        for start in range(0, len(todo), CHUNK):
+            batch = todo[start:start + CHUNK]
+            b_ok = 0
+            for j, (e, r) in enumerate(
+                    pool.imap_unordered(_render_one, batch, chunksize=8), 1):
+                n_ok += (r == "ok")
+                b_ok += (r == "ok")
+                done_i = start + j
+                if done_i % 250 == 0:
+                    dt = time.time() - t0
+                    eta = dt / done_i * (len(todo) - done_i) / 3600
+                    print(f"{done_i}/{len(todo)} ok={n_ok} "
+                          f"{dt/done_i:.2f}s/panel ETA {eta:.1f}h", flush=True)
             part += 1
-            arc = shutil.make_archive(str(drive / f"panels_part_{part:03d}"), "zip", PANELS)
-            sf.write("\n".join(str(x) for x in pending) + "\n")
+            arc = shutil.make_archive(str(drive / f"panels_part_{part:03d}"),
+                                      "zip", PANELS)
+            sf.write("\n".join(str(x) for x in batch) + "\n")
             sf.flush()
+            shutil.rmtree(PANELS)
+            PANELS.mkdir()
+            print(f"checkpoint zip -> {arc} ({b_ok}/{len(batch)} ok, "
+                  f"state flushed)", flush=True)
     man = {"job": "panel_farm_job3", "total": len(e_all), "rendered_this_session": n_ok,
            "parts": part}
     (drive / "farm_manifest.json").write_text(json.dumps(man, indent=2))
