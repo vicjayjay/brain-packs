@@ -14,10 +14,13 @@ PRE-COMMITTED choices (edit AFTER seeing results = p-hacking; changes need a new
   LOSS         NT-Xent, temperature 0.2, two views per image.
   OPT          AdamW lr 3e-4 wd 1e-4, cosine to 0, 1-epoch linear warmup, 20 epochs,
                batch 512, bf16 autocast.
-  EMBED        backbone only (512-d, projection head discarded), batch 1024.
+  EMBED        backbone only (512-d, projection head discarded), bf16 autocast;
+               batch auto-sizes to GPU memory (does not change the trained model).
 
-Resume: every epoch checkpoints to Drive (ckpt_latest.pt); embedding writes
-emb_panels_part_NNN.parquet + sha256 manifest, existing parts skipped.
+One runtime owns pretraining. Any number of runtimes can then embed disjoint,
+interleaved shards of the SAME frozen encoder. Deterministic 50k-row parts and
+per-shard atomic manifests make resume independent of batch size. The last
+runtime merges all complete shard manifests into the judge's original manifest.
 """
 from __future__ import annotations
 
@@ -40,8 +43,72 @@ BATCH = 512
 LR = 3e-4
 WD = 1e-4
 TAU = 0.2
-EMB_BATCH = 1024
 EMB_PART_ROWS = 50_000
+
+
+def shard_index(idx, shard: int, nshards: int):
+    if nshards < 1 or not 0 <= shard < nshards:
+        raise ValueError(f"need 0 <= shard < nshards, got {shard}/{nshards}")
+    return idx[shard::nshards]
+
+
+def _atomic_json(path: Path, payload: dict) -> None:
+    tmp = path.with_suffix(path.suffix + f".tmp-{os.getpid()}")
+    tmp.write_text(json.dumps(payload, indent=2))
+    os.replace(tmp, path)
+
+
+def _atomic_torch_save(payload: dict, path: Path) -> None:
+    import torch
+    tmp = path.with_suffix(path.suffix + f".tmp-{os.getpid()}")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
+def _worker_count() -> int:
+    return max(2, min(32, os.cpu_count() or 2))
+
+
+def _loader_kwargs(workers: int) -> dict:
+    kw = dict(num_workers=workers, pin_memory=True,
+              persistent_workers=workers > 0)
+    if workers > 0:
+        kw["prefetch_factor"] = 4
+    return kw
+
+
+def _auto_embed_batch() -> int:
+    import torch
+    gib = torch.cuda.get_device_properties(0).total_memory / 2**30
+    return max(1024, min(8192, int(gib * 128 // 256 * 256)))
+
+
+def merge_embedding_manifests(out: Path, nshards: int) -> dict:
+    files = {}
+    total = 0
+    for shard in range(nshards):
+        path = out / f"emb_panels_manifest_s{shard}.json"
+        if not path.exists():
+            raise FileNotFoundError(f"missing {path.name}")
+        man = json.loads(path.read_text())
+        if not man.get("complete"):
+            raise RuntimeError(f"shard {shard} is incomplete")
+        if man.get("shard") != shard or man.get("nshards") != nshards:
+            raise RuntimeError(f"shard identity mismatch in {path.name}")
+        if man["n_rows"] != man["expected_rows"]:
+            raise RuntimeError(f"row-count mismatch in {path.name}")
+        for name, meta in man["files"].items():
+            f = out / name
+            h = hashlib.sha256(f.read_bytes()).hexdigest()
+            if h != meta["sha256"]:
+                raise RuntimeError(f"sha256 mismatch on {name}")
+            files[name] = meta
+        total += man["n_rows"]
+    merged = {"job": "panel_embed_job4", "nshards": nshards,
+              "n_rows": total, "complete": True,
+              "files": {name: files[name] for name in sorted(files)}}
+    _atomic_json(out / "emb_panels_manifest.json", merged)
+    return merged
 
 
 def extract_panels(drive_panels: Path) -> list[tuple[int, Path]]:
@@ -180,9 +247,14 @@ def pretrain(idx, out: Path):
         start_ep, step = c["epoch"] + 1, c["step"]
         print(f"resume at epoch {start_ep} (step {step})", flush=True)
 
+    workers = _worker_count()
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
+    print(f"pretrain resource tuning: batch {BATCH} (registered), "
+          f"workers {workers}, prefetch 4, bf16", flush=True)
     dl = DataLoader(_TrainDS(idx, train=True), batch_size=BATCH, shuffle=True,
-                    num_workers=8, pin_memory=True, persistent_workers=True,
-                    drop_last=True, collate_fn=_collate_train)
+                    drop_last=True, collate_fn=_collate_train,
+                    **_loader_kwargs(workers))
     for ep in range(start_ep, EPOCHS):
         t0 = time.time()
         bb.train()
@@ -207,21 +279,30 @@ def pretrain(idx, out: Path):
                       f"lr {lr_at(step):.2e}", flush=True)
         c = {"epoch": ep, "step": step, "bb": bb.state_dict(),
              "proj": proj.state_dict(), "opt": opt.state_dict()}
-        torch.save(c, ckpt_f)
+        _atomic_torch_save(c, ckpt_f)
         print(f"epoch {ep} done, loss {tot/max(1,nb):.4f}, "
               f"{time.time()-t0:.0f}s, ckpt -> Drive", flush=True)
-    torch.save({"bb": bb.state_dict()}, out / "encoder_final.pt")
+    _atomic_torch_save({"bb": bb.state_dict()}, out / "encoder_final.pt")
     print("pretrain done -> encoder_final.pt", flush=True)
 
 
-def embed(idx, out: Path):
+def embed(idx, out: Path, shard: int = 0, nshards: int = 1,
+          workers: int | None = None, batch_size: int = 0):
     import torch
     from torch.utils.data import DataLoader
     dev = "cuda"
+    (out / "emb_panels_manifest.json").unlink(missing_ok=True)
+    encoder_f = out / "encoder_final.pt"
+    while not encoder_f.exists():
+        print("waiting for the single pretraining session to publish "
+              "encoder_final.pt; retry in 60s...", flush=True)
+        time.sleep(60)
     bb, _ = _build_model()
-    c = torch.load(out / "encoder_final.pt", map_location=dev, weights_only=False)
+    c = torch.load(encoder_f, map_location=dev, weights_only=False)
     bb.load_state_dict(c["bb"])
     bb.to(dev).eval()
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
 
     class _IdxDS(_PanelDS):
         def __getitem__(self, i):
@@ -234,65 +315,106 @@ def embed(idx, out: Path):
         xs = torch.stack([b[1] for b in batch])
         return es, xs
 
-    dl = DataLoader(_IdxDS(idx, train=False), batch_size=EMB_BATCH, shuffle=False,
-                    num_workers=8, pin_memory=True, persistent_workers=True,
-                    collate_fn=collate)
-    existing = {p.name for p in out.glob("emb_panels_part_*.parquet")}
-    buf_e, buf_x = [], []
-    part = 0
-    man = {"files": {}}
+    workers = _worker_count() if workers is None else workers
+    batch_size = batch_size or _auto_embed_batch()
+    print(f"embed shard {shard}/{nshards}: {len(idx):,} rows, batch {batch_size}, "
+          f"workers {workers}, prefetch 4, bf16", flush=True)
+    man_f = out / f"emb_panels_manifest_s{shard}.json"
+    man = json.loads(man_f.read_text()) if man_f.exists() else {
+        "job": "panel_embed_job4", "shard": shard, "nshards": nshards,
+        "expected_rows": len(idx), "files": {}}
+    if man.get("shard") != shard or man.get("nshards") != nshards:
+        raise RuntimeError(f"shard identity mismatch in {man_f.name}")
+    man.update(expected_rows=len(idx), complete=False)
     t0 = time.time()
 
-    def flush():
-        nonlocal part, buf_e, buf_x
-        if not buf_e:
-            return
-        name = f"emb_panels_part_{part:03d}.parquet"
-        part += 1
-        if name in existing:
-            print(f"skip {name} (exists)", flush=True)
-            buf_e, buf_x = [], []
-            return
-        df = pd.DataFrame({"e": np.concatenate(buf_e)})
-        X = np.concatenate(buf_x).astype(np.float32)
-        for j in range(X.shape[1]):
-            df[f"d{j}"] = X[:, j]
-        df.to_parquet(out / name, index=False)
-        h = hashlib.sha256((out / name).read_bytes()).hexdigest()
-        man["files"][name] = {"rows": len(df), "sha256": h}
-        print(f"{name}: {len(df):,} rows sha256 {h[:12]}...", flush=True)
-        buf_e, buf_x = [], []
+    for part, start in enumerate(range(0, len(idx), EMB_PART_ROWS)):
+        part_idx = idx[start:start + EMB_PART_ROWS]
+        name = f"emb_panels_s{shard}_part_{part:03d}.parquet"
+        f = out / name
+        if f.exists():
+            rows = len(pd.read_parquet(f, columns=["e"]))
+            if rows != len(part_idx):
+                raise RuntimeError(f"row-count mismatch in existing {name}")
+            man["files"][name] = {"rows": rows,
+                                  "sha256": hashlib.sha256(f.read_bytes()).hexdigest()}
+            man["n_rows"] = sum(m["rows"] for m in man["files"].values())
+            _atomic_json(man_f, man)
+            print(f"skip {name} ({rows:,} rows, verified)", flush=True)
+            continue
 
-    with torch.no_grad():
-        for es, xs in dl:
-            xs = xs.to(dev, non_blocking=True)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                z = bb(xs)
-            buf_e.append(es.numpy())
-            buf_x.append(z.float().cpu().numpy())
-            if sum(len(b) for b in buf_e) >= EMB_PART_ROWS:
-                flush()
-    flush()
-    man["n_rows"] = sum(f["rows"] for f in man["files"].values())
-    man["elapsed_s"] = round(time.time() - t0, 1)
-    (out / "emb_panels_manifest.json").write_text(json.dumps(man, indent=2))
-    print(f"embed done: {man['n_rows']:,} rows in {len(man['files'])} parts", flush=True)
+        while True:
+            buf_e, buf_x = [], []
+            try:
+                dl = DataLoader(_IdxDS(part_idx, train=False), batch_size=batch_size,
+                                shuffle=False, collate_fn=collate,
+                                **_loader_kwargs(workers))
+                with torch.inference_mode():
+                    for es, xs in dl:
+                        xs = xs.to(dev, non_blocking=True)
+                        with torch.autocast("cuda", dtype=torch.bfloat16):
+                            z = bb(xs)
+                        buf_e.append(es.numpy())
+                        buf_x.append(z.float().cpu().numpy())
+                break
+            except torch.cuda.OutOfMemoryError:
+                del dl, buf_e, buf_x
+                torch.cuda.empty_cache()
+                if batch_size <= 256:
+                    raise
+                batch_size //= 2
+                print(f"CUDA OOM; retry {name} with batch {batch_size}", flush=True)
+
+        X = np.concatenate(buf_x).astype(np.float32)
+        if X.shape != (len(part_idx), 512):
+            raise RuntimeError(f"unexpected output shape for {name}: {X.shape}")
+        df = pd.DataFrame(X, columns=[f"d{j}" for j in range(X.shape[1])])
+        df.insert(0, "e", np.concatenate(buf_e))
+        tmp = f.with_suffix(f".parquet.tmp-{os.getpid()}")
+        df.to_parquet(tmp, index=False)
+        os.replace(tmp, f)
+        man["files"][name] = {"rows": len(df),
+                              "sha256": hashlib.sha256(f.read_bytes()).hexdigest()}
+        man["n_rows"] = sum(m["rows"] for m in man["files"].values())
+        _atomic_json(man_f, man)
+        print(f"{name}: {len(df):,} rows; shard total {man['n_rows']:,}/{len(idx):,}",
+              flush=True)
+
+    man["n_rows"] = sum(m["rows"] for m in man["files"].values())
+    if man["n_rows"] != len(idx):
+        raise RuntimeError(f"shard {shard} has {man['n_rows']} of {len(idx)} rows")
+    man.update(complete=True, elapsed_s=round(time.time() - t0, 1))
+    _atomic_json(man_f, man)
+    print(f"embed shard {shard} done: {man['n_rows']:,} rows "
+          f"in {len(man['files'])} parts", flush=True)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["pretrain", "embed", "all"])
-    ap.add_argument("--drive-panels", required=True)
+    ap.add_argument("cmd", choices=["pretrain", "embed", "all", "finalize"])
+    ap.add_argument("--drive-panels")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--shard", type=int, default=0)
+    ap.add_argument("--nshards", type=int, default=1)
+    ap.add_argument("--workers", type=int, default=-1,
+                    help="data-loader workers; -1 auto-uses available vCPUs (cap 32)")
+    ap.add_argument("--embed-batch", type=int, default=0,
+                    help="inference batch; 0 auto-sizes from GPU memory with OOM fallback")
     ap.add_argument("--allow-partial", action="store_true",
                     help="embed before the farm is complete (NOT judged-safe)")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
+    if a.cmd == "finalize":
+        man = merge_embedding_manifests(out, a.nshards)
+        print(f"combined manifest ready: {man['n_rows']:,} rows, "
+              f"{len(man['files'])} parts", flush=True)
+        return
+    if not a.drive_panels:
+        ap.error("--drive-panels is required unless cmd=finalize")
+    shard_index([], a.shard, a.nshards)
     drive_panels = Path(a.drive_panels)
     if a.cmd in ("embed", "all") and not a.allow_partial:
-        # embedding parts are positional over the sorted index: running embed
-        # before the farm is complete would freeze wrong part boundaries
         if not (drive_panels / "FARM_COMPLETE.txt").exists():
             raise SystemExit(
                 "refusing to embed: FARM_COMPLETE.txt not in the panels folder. "
@@ -303,7 +425,22 @@ def main():
     if a.cmd in ("pretrain", "all"):
         pretrain(idx, out)
     if a.cmd in ("embed", "all"):
-        embed(idx, out)
+        embed(shard_index(idx, a.shard, a.nshards), out, a.shard, a.nshards,
+              workers=None if a.workers < 0 else a.workers,
+              batch_size=a.embed_batch)
+        ready = True
+        for shard in range(a.nshards):
+            f = out / f"emb_panels_manifest_s{shard}.json"
+            ready = ready and f.exists() and json.loads(f.read_text()).get("complete", False)
+        if ready:
+            man = merge_embedding_manifests(out, a.nshards)
+            if man["n_rows"] != len(idx):
+                raise RuntimeError(f"combined {man['n_rows']} rows != {len(idx)} panels")
+            print(f"ALL SHARDS COMBINED: {man['n_rows']:,} rows; judge input ready",
+                  flush=True)
+        else:
+            print("this shard is complete; waiting on other shard(s) before final merge",
+                  flush=True)
 
 
 if __name__ == "__main__":
